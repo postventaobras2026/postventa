@@ -688,6 +688,7 @@ async function migrarBaseAnterior(){
    ============================================================ */
 const nuevoId = () => "rel_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2,7);
 
+let volverA = "p-lista";    // pantalla a la que se vuelve desde Conexión y Precios
 let actual = null;          // relevamiento en edición
 let hallazgoEnEdicion = null;
 let pantallaActual = "p-lista";
@@ -752,365 +753,7 @@ document.getElementById("barra-inf").addEventListener("click", async e => {
   if (acc === "nuevo"){ actual = relevamientoVacio(); cargarFormulario(); mostrar("p-obra"); }
   if (acc === "siguiente"){ leerFormulario(); await DB.guardar(actual); mostrar(PASOS[i+1]); }
   if (acc === "atras"){ leerFormulario(); await DB.guardar(actual); mostrar(PASOS[i-1]); }
-  if (acc === "salir"){ leerFormulario(); await DB.guardar(actual); /* ============================================================
-   13. SINCRONIZACIÓN CON SUPABASE
-   La app funciona sin esto. Cuando hay conexión y sesión abierta,
-   cada relevamiento sube en una sola llamada transaccional.
-   ============================================================ */
-const SB = {
-  config(){ try{ return JSON.parse(localStorage.getItem("mv_sb") || "{}"); }catch{ return {}; } },
-  guardarConfig(c){ localStorage.setItem("mv_sb", JSON.stringify(c)); },
-  sesion(){ try{ return JSON.parse(localStorage.getItem("mv_sesion") || "null"); }catch{ return null; } },
-  guardarSesion(s){ s ? localStorage.setItem("mv_sesion", JSON.stringify(s)) : localStorage.removeItem("mv_sesion"); },
-  listo(){ const c = this.config(); return !!(c.url && c.key && this.sesion()?.access_token); }
-};
-
-/* Los usuarios pegan la URL con /rest/v1/ o con barra final; nos quedamos con el origen */
-function normalizarUrl(t){
-  t = (t || "").trim();
-  if (!t) return "";
-  if (!/^https?:\/\//i.test(t)) t = "https://" + t;
-  try{ return new URL(t).origin; }catch{ return ""; }
-}
-
-/* Toda llamada lleva corte por tiempo: en obra la red se cuelga sin cerrar nunca */
-async function sbFetch(ruta, opts = {}, ms = 20000, reintento = true){
-  const c = SB.config();
-  if (!c.url || !c.key) throw new Error("Falta configurar la conexión");
-  const s = SB.sesion();
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), ms);
-  try{
-    const r = await fetch(c.url + ruta, {
-      ...opts, signal: ctrl.signal,
-      headers: {
-        apikey: c.key,
-        ...(s?.access_token ? {Authorization: "Bearer " + s.access_token} : {}),
-        ...(opts.headers || {})
-      }
-    });
-    if (r.status === 401 && reintento && s?.refresh_token){
-      if (await renovarSesion()) return sbFetch(ruta, opts, ms, false);
-    }
-    if (!r.ok){
-      const txt = await r.text().catch(() => "");
-      let msg = txt;
-      try{ const j = JSON.parse(txt); msg = j.message || j.error_description || j.msg || txt; }catch{}
-      throw new Error(msg || `Error ${r.status}`);
-    }
-    return r;
-  }catch(e){
-    if (e.name === "AbortError") throw new Error("La conexión tardó demasiado");
-    throw e;
-  }finally{ clearTimeout(t); }
-}
-
-async function iniciarSesion(email, pass){
-  const c = SB.config();
-  const r = await fetch(`${c.url}/auth/v1/token?grant_type=password`, {
-    method: "POST",
-    headers: {apikey: c.key, "Content-Type": "application/json"},
-    body: JSON.stringify({email, password: pass})
-  });
-  const d = await r.json();
-  if (!r.ok) throw new Error(d.error_description || d.msg || "Usuario o contraseña incorrectos");
-  SB.guardarSesion({
-    access_token: d.access_token, refresh_token: d.refresh_token,
-    email: d.user?.email, uid: d.user?.id,
-    expira: Date.now() + (d.expires_in || 3600) * 1000
-  });
-  return true;
-}
-
-async function renovarSesion(){
-  const c = SB.config(), s = SB.sesion();
-  if (!s?.refresh_token) return false;
-  try{
-    const r = await fetch(`${c.url}/auth/v1/token?grant_type=refresh_token`, {
-      method: "POST",
-      headers: {apikey: c.key, "Content-Type": "application/json"},
-      body: JSON.stringify({refresh_token: s.refresh_token})
-    });
-    if (!r.ok) return false;
-    const d = await r.json();
-    SB.guardarSesion({...s, access_token: d.access_token, refresh_token: d.refresh_token,
-                      expira: Date.now() + (d.expires_in || 3600) * 1000});
-    return true;
-  }catch{ return false; }
-}
-
-function cerrarSesion(){
-  SB.guardarSesion(null);
-  pintarConexion(); pintarEstadoNube();
-}
-
-/* ---------- Catálogo de obras: se baja una vez y queda offline ---------- */
-async function bajarCatalogo(){
-  const r = await sbFetch("/rest/v1/catalogo_obras?select=*&limit=2000", {
-    headers: {Accept: "application/json"}
-  });
-  const obras = await r.json();
-  await DB.catLimpiar();
-  for (const o of obras) await DB.catGuardar(o);
-  localStorage.setItem("mv_catalogo_fecha", new Date().toISOString());
-  return obras.length;
-}
-
-/* ---------- Baremo desde el servidor: manda el de Costos, no el del celular ---------- */
-async function bajarBaremo(){
-  const r = await sbFetch("/rest/v1/baremo?select=tipo,partida,unidad,precio_gs&vigente_hasta=is.null", {
-    headers: {Accept: "application/json"}
-  });
-  const filas = await r.json();
-  let n = 0;
-  filas.forEach(f => {
-    if (!BAREMO[f.tipo]) return;
-    BAREMO[f.tipo] = {partida: f.partida, unidad: f.unidad === "m2" ? "m²" : f.unidad,
-                      precio: Number(f.precio_gs)};
-    n++;
-  });
-  if (n){ CONFIG.calibrado = true; guardarBaremo(); }
-  return n;
-}
-
-/* ---------- Fotos: van al Storage, no adentro del JSON ---------- */
-async function subirFoto(ruta, dataUrl){
-  const blob = await (await fetch(dataUrl)).blob();
-  await sbFetch(`/storage/v1/object/relevamientos/${ruta}`, {
-    method: "POST", body: blob,
-    headers: {"Content-Type": blob.type || "image/jpeg", "x-upsert": "true"}
-  }, 45000);
-  return ruta;
-}
-
-/* ---------- Subida de un relevamiento ---------- */
-async function subirRelevamiento(r, avance = () => {}){
-  const hallazgos = [];
-  for (let i = 0; i < r.hallazgos.length; i++){
-    const h = r.hallazgos[i];
-    avance(`Subiendo foto ${i + 1} de ${r.hallazgos.length}…`);
-    const base = `${r.id}/${h.id}`;
-    let orig = h.foto_original || null, marc = h.foto_marcada || null;
-    try{
-      if (h.original && !orig) orig = await subirFoto(`${base}_orig.jpg`, h.original);
-      if (h.imagen   && !marc) marc = await subirFoto(`${base}_marcada.jpg`, h.imagen);
-      h.foto_original = orig; h.foto_marcada = marc;   // no se vuelven a subir
-    }catch(e){
-      throw new Error(`No se pudo subir la foto del hallazgo ${i + 1}: ${e.message}`);
-    }
-    hallazgos.push({
-      tipo: h.tipo, severidad: h.severidad, ubicacion: h.ubicacion,
-      cantidad: h.cantidad, unidad: BAREMO[h.tipo]?.unidad || "u", nota: h.nota,
-      foto_original: orig, foto_marcada: marc, trazos: h.trazos || []
-    });
-  }
-
-  avance("Registrando el relevamiento…");
-  const payload = {
-    id_local: r.id, obra_id: r.obra_id || null, cliente_id: r.cliente_id || null,
-    ticket_id: r.ticket_id || null,
-    cliente: r.cliente, contacto: r.contacto, cel: r.cel, dir: r.dir, fecha: r.fecha,
-    ot: r.ot, m2: r.m2, descripcion: r.descripcion,
-    dias: r.dias, personas: r.personas, km: r.km, altura: r.altura,
-    lat: r.lat || null, lng: r.lng || null, precision: r.precision || null,
-    checklist: r.checklist || {}, materiales: (r.materiales || []).filter(m => m.material),
-    hallazgos, estimacion: r.estimacion || null, ia: r.ia || null
-  };
-
-  const res = await sbFetch("/rest/v1/rpc/sync_relevamiento", {
-    method: "POST",
-    headers: {"Content-Type": "application/json", Accept: "application/json"},
-    body: JSON.stringify({p: payload})
-  }, 30000);
-  const d = await res.json();
-
-  r.estado = "sincronizado";
-  r.obra_id = d.obra_id; r.cliente_id = d.cliente_id;
-  r.servidor_id = d.relevamiento_id; r.sincronizado_en = new Date().toISOString();
-  await DB.guardar(r);
-  return d;
-}
-
-/* ---------- Cola: sube todo lo pendiente, uno por vez ---------- */
-let sincronizando = false;
-
-async function sincronizarTodo(silencioso = false){
-  if (sincronizando) return;
-  if (!SB.listo()){
-    if (!silencioso) avisar("Primero configurá la conexión e iniciá sesión", true);
-    return;
-  }
-  if (!navigator.onLine){
-    if (!silencioso) avisar("Sin conexión. Se sube cuando vuelva la señal", true);
-    return;
-  }
-  const todos = (await DB.todos()) || [];
-  const pendientes = todos.filter(r => r.estado !== "sincronizado");
-  if (!pendientes.length){
-    if (!silencioso) avisar("No hay nada pendiente de subir");
-    return;
-  }
-
-  sincronizando = true;
-  pintarEstadoNube("subiendo");
-  let ok = 0; const errores = [];
-  for (const r of pendientes){
-    try{
-      await subirRelevamiento(r, txt => pintarEstadoNube("subiendo", txt));
-      ok++;
-    }catch(e){
-      errores.push(`${r.cliente || r.id}: ${e.message}`);
-      r.estado = "error"; r.ultimo_error = e.message;
-      await DB.guardar(r);
-    }
-  }
-  sincronizando = false;
-  pintarEstadoNube();
-  if (pantallaActual === "p-lista") pintarLista();
-  if (pantallaActual === "p-conexion") pintarConexion();
-
-  if (errores.length) avisar(`${ok} subidos, ${errores.length} con error`, true);
-  else avisar(`${ok} relevamiento${ok === 1 ? "" : "s"} subido${ok === 1 ? "" : "s"}`);
-  if (errores.length) console.warn("Errores de sincronización:", errores);
-}
-
-/* Reintento automático al recuperar señal: el inspector no tiene que acordarse */
-window.addEventListener("online", () => { pintarEstadoNube(); sincronizarTodo(true); });
-window.addEventListener("offline", () => pintarEstadoNube());
-
-/* ---------- Indicador en el encabezado ---------- */
-function pintarEstadoNube(estado, detalle){
-  const b = document.getElementById("btn-nube");
-  if (!b) return;
-  if (estado === "subiendo"){ b.textContent = "⟳"; b.title = detalle || "Subiendo…"; b.classList.add("girando"); return; }
-  b.classList.remove("girando");
-  if (!navigator.onLine){ b.textContent = "⚠"; b.title = "Sin conexión"; return; }
-  if (!SB.listo()){ b.textContent = "☁"; b.title = "Conexión sin configurar"; return; }
-  b.textContent = "☁"; b.title = "Conectado a Supabase";
-}
-
-/* ---------- Pantalla de conexión ---------- */
-function pintarConexion(){
-  const c = SB.config(), s = SB.sesion();
-  document.getElementById("cx-url").value = c.url || "";
-  document.getElementById("cx-key").value = c.key || "";
-
-  const box = document.getElementById("cx-sesion");
-  if (s?.access_token){
-    const fecha = localStorage.getItem("mv_catalogo_fecha");
-    box.innerHTML = `
-      <div class="estado sync" style="margin-bottom:12px">Sesión abierta · ${esc(s.email || "")}</div>
-      <div style="display:flex;gap:10px;flex-wrap:wrap">
-        <button class="btn btn-sec" style="flex:1" id="cx-catalogo">Bajar catálogo de obras</button>
-        <button class="btn btn-sec" style="flex:1" id="cx-baremo">Bajar precios</button>
-      </div>
-      <p style="color:var(--texto-2);font-size:13px;margin:12px 0 0">
-        ${fecha ? "Catálogo actualizado el " + fecha.slice(0,10) : "Todavía no bajaste el catálogo de obras."}</p>
-      <button class="btn btn-peligro btn-bloque" id="cx-salir" style="margin-top:14px">Cerrar sesión</button>`;
-    document.getElementById("cx-catalogo").onclick = async e => {
-      e.target.disabled = true; e.target.textContent = "Bajando…";
-      try{ const n = await bajarCatalogo(); avisar(`${n} obras disponibles sin conexión`); pintarConexion(); }
-      catch(err){ avisar(err.message, true); pintarConexion(); }
-    };
-    document.getElementById("cx-baremo").onclick = async e => {
-      e.target.disabled = true; e.target.textContent = "Bajando…";
-      try{ const n = await bajarBaremo(); avisar(n ? `${n} precios actualizados` : "El servidor no tiene precios cargados", !n); }
-      catch(err){ avisar(err.message, true); }
-      pintarConexion();
-    };
-    document.getElementById("cx-salir").onclick = () => { if (confirm("¿Cerrar sesión en este equipo?")) cerrarSesion(); };
-  } else {
-    box.innerHTML = `
-      <label class="campo"><span>Correo</span><input type="text" id="cx-mail" autocomplete="username" inputmode="email"></label>
-      <label class="campo"><span>Contraseña</span><input type="password" id="cx-pass" autocomplete="current-password"></label>
-      <button class="btn btn-primario btn-bloque" id="cx-entrar">Iniciar sesión</button>
-      <p style="color:var(--texto-2);font-size:13px;margin:12px 0 0">
-        Las credenciales las crea el administrador en Supabase. La sesión queda abierta en este equipo.</p>`;
-    document.getElementById("cx-entrar").onclick = async e => {
-      const url = normalizarUrl(document.getElementById("cx-url").value);
-      const key = document.getElementById("cx-key").value.trim();
-      if (!url) return avisar("La dirección del proyecto no es válida", true);
-      if (!key) return avisar("Falta la clave anónima", true);
-      SB.guardarConfig({url, key});
-      e.target.disabled = true; e.target.textContent = "Entrando…";
-      try{
-        await iniciarSesion(document.getElementById("cx-mail").value.trim(),
-                            document.getElementById("cx-pass").value);
-        avisar("Sesión iniciada");
-        pintarConexion(); pintarEstadoNube();
-        try{ await bajarCatalogo(); await bajarBaremo(); }catch{}
-        pintarConexion();
-      }catch(err){
-        avisar(err.message, true);
-        e.target.disabled = false; e.target.textContent = "Iniciar sesión";
-      }
-    };
-  }
-
-  const pend = document.getElementById("cx-pendientes");
-  DB.todos().then(t => {
-    const p = (t || []).filter(r => r.estado !== "sincronizado");
-    const conError = p.filter(r => r.estado === "error");
-    pend.innerHTML = !p.length
-      ? `<p style="color:var(--texto-2);margin:0">Todo sincronizado.</p>`
-      : `<p style="margin:0 0 12px">${p.length} relevamiento${p.length===1?"":"s"} sin subir${
-          conError.length ? ` · <b style="color:var(--f-fisura)">${conError.length} con error</b>` : ""}.</p>
-         ${conError.map(r => `<div style="font-size:13px;color:var(--texto-2);margin-bottom:6px">
-            <b>${esc(r.cliente || r.id)}:</b> ${esc(r.ultimo_error || "")}</div>`).join("")}
-         <button class="btn btn-verde btn-bloque" id="cx-subir" style="margin-top:10px">Subir ahora</button>`;
-    const b = document.getElementById("cx-subir");
-    if (b) b.onclick = () => sincronizarTodo();
-  });
-}
-
-/* ---------- Selector de obra en el paso 1 ---------- */
-async function pintarSelectorObra(){
-  const sel = document.getElementById("f-obra_id");
-  if (!sel) return;
-  const obras = (await DB.catTodos()) || [];
-  obras.sort((a,b) => (a.razon_social||"").localeCompare(b.razon_social||""));
-  sel.innerHTML = `<option value="">— Obra nueva o no listada —</option>` +
-    obras.map(o => `<option value="${o.id}">${esc(o.razon_social)} — ${esc(o.nombre)}</option>`).join("");
-  sel.value = actual?.obra_id || "";
-  document.getElementById("aviso-catalogo").textContent = obras.length
-    ? `${obras.length} obras disponibles sin conexión.`
-    : "Sin catálogo bajado: cargá los datos a mano o bajá el catálogo desde Conexión.";
-}
-
-document.addEventListener("change", async e => {
-  if (e.target.id !== "f-obra_id") return;
-  const id = e.target.value;
-  if (!id){
-    actual.obra_id = null; actual.cliente_id = null;
-    document.getElementById("f-cliente_id").value = "";
-    return;
-  }
-  const o = ((await DB.catTodos()) || []).find(x => x.id === id);
-  if (!o) return;
-  actual.obra_id = o.id; actual.cliente_id = o.cliente_id;
-  document.getElementById("f-cliente_id").value = o.cliente_id || "";
-  const poner = (campo, valor) => { if (valor != null && valor !== ""){ actual[campo] = valor; const el = document.getElementById("f-" + campo); if (el) el.value = valor; } };
-  poner("cliente", o.razon_social); poner("dir", o.direccion);
-  poner("ot", o.ot_original); poner("m2", o.superficie_m2);
-  poner("contacto", o.contacto); poner("cel", o.telefono);
-  DB.guardar(actual);
-  avisar("Datos de la obra cargados");
-});
-
-document.getElementById("btn-nube").addEventListener("click", () => {
-  if (pantallaActual !== "p-conexion"){ volverA = pantallaActual; mostrar("p-conexion"); }
-});
-
-
-(async () => {
-  try{
-    const n = await migrarBaseAnterior();
-    if (n) avisar(`Se recuperaron ${n} relevamiento${n===1?"":"s"} de la versión anterior`);
-  }catch(e){ console.warn("Migración omitida:", e); }
-  mostrar("p-lista");
-  pintarEstadoNube();
-  if (SB.listo() && navigator.onLine) sincronizarTodo(true);
-})(); }
+  if (acc === "salir"){ leerFormulario(); await DB.guardar(actual); mostrar("p-lista"); }
   if (acc === "informe"){ leerFormulario(); calcularEstimacion(); await DB.guardar(actual); mostrar("p-informe"); }
   if (acc === "volver-estim") mostrar("p-estimacion");
   if (acc === "pdf") window.print();
@@ -1674,8 +1317,6 @@ document.getElementById("btn-ia").addEventListener("click", async () => {
 /* ============================================================
    10b. PRECIOS UNITARIOS
    ============================================================ */
-let volverA = "p-lista";
-
 document.getElementById("btn-precios").addEventListener("click", () => {
   if (pantallaActual !== "p-precios"){ volverA = pantallaActual; mostrar("p-precios"); }
 });
@@ -1860,6 +1501,366 @@ document.documentElement.dataset.tema = localStorage.getItem("mv_tema") || "clar
 window.addEventListener("beforeunload", () => { if (actual){ leerFormulario(); DB.guardar(actual); } });
 
 mostrar("p-lista");
+
+/* ============================================================
+   13. SINCRONIZACIÓN CON SUPABASE
+   La app funciona sin esto. Cuando hay conexión y sesión abierta,
+   cada relevamiento sube en una sola llamada transaccional.
+   ============================================================ */
+const SB = {
+  config(){ try{ return JSON.parse(localStorage.getItem("mv_sb") || "{}"); }catch{ return {}; } },
+  guardarConfig(c){ localStorage.setItem("mv_sb", JSON.stringify(c)); },
+  sesion(){ try{ return JSON.parse(localStorage.getItem("mv_sesion") || "null"); }catch{ return null; } },
+  guardarSesion(s){ s ? localStorage.setItem("mv_sesion", JSON.stringify(s)) : localStorage.removeItem("mv_sesion"); },
+  listo(){ const c = this.config(); return !!(c.url && c.key && this.sesion()?.access_token); }
+};
+
+/* Los usuarios pegan la URL con /rest/v1/ o con barra final; nos quedamos con el origen */
+function normalizarUrl(t){
+  t = (t || "").trim();
+  if (!t) return "";
+  if (!/^https?:\/\//i.test(t)) t = "https://" + t;
+  try{ return new URL(t).origin; }catch{ return ""; }
+}
+
+/* Toda llamada lleva corte por tiempo: en obra la red se cuelga sin cerrar nunca */
+async function sbFetch(ruta, opts = {}, ms = 20000, reintento = true){
+  const c = SB.config();
+  if (!c.url || !c.key) throw new Error("Falta configurar la conexión");
+  const s = SB.sesion();
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try{
+    const r = await fetch(c.url + ruta, {
+      ...opts, signal: ctrl.signal,
+      headers: {
+        apikey: c.key,
+        ...(s?.access_token ? {Authorization: "Bearer " + s.access_token} : {}),
+        ...(opts.headers || {})
+      }
+    });
+    if (r.status === 401 && reintento && s?.refresh_token){
+      if (await renovarSesion()) return sbFetch(ruta, opts, ms, false);
+    }
+    if (!r.ok){
+      const txt = await r.text().catch(() => "");
+      let msg = txt;
+      try{ const j = JSON.parse(txt); msg = j.message || j.error_description || j.msg || txt; }catch{}
+      throw new Error(msg || `Error ${r.status}`);
+    }
+    return r;
+  }catch(e){
+    if (e.name === "AbortError") throw new Error("La conexión tardó demasiado");
+    throw e;
+  }finally{ clearTimeout(t); }
+}
+
+async function iniciarSesion(email, pass){
+  const c = SB.config();
+  const r = await fetch(`${c.url}/auth/v1/token?grant_type=password`, {
+    method: "POST",
+    headers: {apikey: c.key, "Content-Type": "application/json"},
+    body: JSON.stringify({email, password: pass})
+  });
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error_description || d.msg || "Usuario o contraseña incorrectos");
+  SB.guardarSesion({
+    access_token: d.access_token, refresh_token: d.refresh_token,
+    email: d.user?.email, uid: d.user?.id,
+    expira: Date.now() + (d.expires_in || 3600) * 1000
+  });
+  return true;
+}
+
+async function renovarSesion(){
+  const c = SB.config(), s = SB.sesion();
+  if (!s?.refresh_token) return false;
+  try{
+    const r = await fetch(`${c.url}/auth/v1/token?grant_type=refresh_token`, {
+      method: "POST",
+      headers: {apikey: c.key, "Content-Type": "application/json"},
+      body: JSON.stringify({refresh_token: s.refresh_token})
+    });
+    if (!r.ok) return false;
+    const d = await r.json();
+    SB.guardarSesion({...s, access_token: d.access_token, refresh_token: d.refresh_token,
+                      expira: Date.now() + (d.expires_in || 3600) * 1000});
+    return true;
+  }catch{ return false; }
+}
+
+function cerrarSesion(){
+  SB.guardarSesion(null);
+  pintarConexion(); pintarEstadoNube();
+}
+
+/* ---------- Catálogo de obras: se baja una vez y queda offline ---------- */
+async function bajarCatalogo(){
+  const r = await sbFetch("/rest/v1/catalogo_obras?select=*&limit=2000", {
+    headers: {Accept: "application/json"}
+  });
+  const obras = await r.json();
+  await DB.catLimpiar();
+  for (const o of obras) await DB.catGuardar(o);
+  localStorage.setItem("mv_catalogo_fecha", new Date().toISOString());
+  return obras.length;
+}
+
+/* ---------- Baremo desde el servidor: manda el de Costos, no el del celular ---------- */
+async function bajarBaremo(){
+  const r = await sbFetch("/rest/v1/baremo?select=tipo,partida,unidad,precio_gs&vigente_hasta=is.null", {
+    headers: {Accept: "application/json"}
+  });
+  const filas = await r.json();
+  let n = 0;
+  filas.forEach(f => {
+    if (!BAREMO[f.tipo]) return;
+    BAREMO[f.tipo] = {partida: f.partida, unidad: f.unidad === "m2" ? "m²" : f.unidad,
+                      precio: Number(f.precio_gs)};
+    n++;
+  });
+  if (n){ CONFIG.calibrado = true; guardarBaremo(); }
+  return n;
+}
+
+/* ---------- Fotos: van al Storage, no adentro del JSON ---------- */
+async function subirFoto(ruta, dataUrl){
+  const blob = await (await fetch(dataUrl)).blob();
+  await sbFetch(`/storage/v1/object/relevamientos/${ruta}`, {
+    method: "POST", body: blob,
+    headers: {"Content-Type": blob.type || "image/jpeg", "x-upsert": "true"}
+  }, 45000);
+  return ruta;
+}
+
+/* ---------- Subida de un relevamiento ---------- */
+async function subirRelevamiento(r, avance = () => {}){
+  const hallazgos = [];
+  for (let i = 0; i < r.hallazgos.length; i++){
+    const h = r.hallazgos[i];
+    avance(`Subiendo foto ${i + 1} de ${r.hallazgos.length}…`);
+    const base = `${r.id}/${h.id}`;
+    let orig = h.foto_original || null, marc = h.foto_marcada || null;
+    try{
+      if (h.original && !orig) orig = await subirFoto(`${base}_orig.jpg`, h.original);
+      if (h.imagen   && !marc) marc = await subirFoto(`${base}_marcada.jpg`, h.imagen);
+      h.foto_original = orig; h.foto_marcada = marc;   // no se vuelven a subir
+    }catch(e){
+      throw new Error(`No se pudo subir la foto del hallazgo ${i + 1}: ${e.message}`);
+    }
+    hallazgos.push({
+      tipo: h.tipo, severidad: h.severidad, ubicacion: h.ubicacion,
+      cantidad: h.cantidad, unidad: BAREMO[h.tipo]?.unidad || "u", nota: h.nota,
+      foto_original: orig, foto_marcada: marc, trazos: h.trazos || []
+    });
+  }
+
+  avance("Registrando el relevamiento…");
+  const payload = {
+    id_local: r.id, obra_id: r.obra_id || null, cliente_id: r.cliente_id || null,
+    ticket_id: r.ticket_id || null,
+    cliente: r.cliente, contacto: r.contacto, cel: r.cel, dir: r.dir, fecha: r.fecha,
+    ot: r.ot, m2: r.m2, descripcion: r.descripcion,
+    dias: r.dias, personas: r.personas, km: r.km, altura: r.altura,
+    lat: r.lat || null, lng: r.lng || null, precision: r.precision || null,
+    checklist: r.checklist || {}, materiales: (r.materiales || []).filter(m => m.material),
+    hallazgos, estimacion: r.estimacion || null, ia: r.ia || null
+  };
+
+  const res = await sbFetch("/rest/v1/rpc/sync_relevamiento", {
+    method: "POST",
+    headers: {"Content-Type": "application/json", Accept: "application/json"},
+    body: JSON.stringify({p: payload})
+  }, 30000);
+  const d = await res.json();
+
+  r.estado = "sincronizado";
+  r.obra_id = d.obra_id; r.cliente_id = d.cliente_id;
+  r.servidor_id = d.relevamiento_id; r.sincronizado_en = new Date().toISOString();
+  await DB.guardar(r);
+  return d;
+}
+
+/* ---------- Cola: sube todo lo pendiente, uno por vez ---------- */
+let sincronizando = false;
+
+async function sincronizarTodo(silencioso = false){
+  if (sincronizando) return;
+  if (!SB.listo()){
+    if (!silencioso) avisar("Primero configurá la conexión e iniciá sesión", true);
+    return;
+  }
+  if (!navigator.onLine){
+    if (!silencioso) avisar("Sin conexión. Se sube cuando vuelva la señal", true);
+    return;
+  }
+  const todos = (await DB.todos()) || [];
+  const pendientes = todos.filter(r => r.estado !== "sincronizado");
+  if (!pendientes.length){
+    if (!silencioso) avisar("No hay nada pendiente de subir");
+    return;
+  }
+
+  sincronizando = true;
+  pintarEstadoNube("subiendo");
+  let ok = 0; const errores = [];
+  for (const r of pendientes){
+    try{
+      await subirRelevamiento(r, txt => pintarEstadoNube("subiendo", txt));
+      ok++;
+    }catch(e){
+      errores.push(`${r.cliente || r.id}: ${e.message}`);
+      r.estado = "error"; r.ultimo_error = e.message;
+      await DB.guardar(r);
+    }
+  }
+  sincronizando = false;
+  pintarEstadoNube();
+  if (pantallaActual === "p-lista") pintarLista();
+  if (pantallaActual === "p-conexion") pintarConexion();
+
+  if (errores.length) avisar(`${ok} subidos, ${errores.length} con error`, true);
+  else avisar(`${ok} relevamiento${ok === 1 ? "" : "s"} subido${ok === 1 ? "" : "s"}`);
+  if (errores.length) console.warn("Errores de sincronización:", errores);
+}
+
+/* Reintento automático al recuperar señal: el inspector no tiene que acordarse */
+window.addEventListener("online", () => { pintarEstadoNube(); sincronizarTodo(true); });
+window.addEventListener("offline", () => pintarEstadoNube());
+
+/* ---------- Indicador en el encabezado ---------- */
+function pintarEstadoNube(estado, detalle){
+  const b = document.getElementById("btn-nube");
+  if (!b) return;
+  if (estado === "subiendo"){ b.textContent = "⟳"; b.title = detalle || "Subiendo…"; b.classList.add("girando"); return; }
+  b.classList.remove("girando");
+  if (!navigator.onLine){ b.textContent = "⚠"; b.title = "Sin conexión"; return; }
+  if (!SB.listo()){ b.textContent = "☁"; b.title = "Conexión sin configurar"; return; }
+  b.textContent = "☁"; b.title = "Conectado a Supabase";
+}
+
+/* ---------- Pantalla de conexión ---------- */
+function pintarConexion(){
+  const c = SB.config(), s = SB.sesion();
+  document.getElementById("cx-url").value = c.url || "";
+  document.getElementById("cx-key").value = c.key || "";
+
+  const box = document.getElementById("cx-sesion");
+  if (s?.access_token){
+    const fecha = localStorage.getItem("mv_catalogo_fecha");
+    box.innerHTML = `
+      <div class="estado sync" style="margin-bottom:12px">Sesión abierta · ${esc(s.email || "")}</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn btn-sec" style="flex:1" id="cx-catalogo">Bajar catálogo de obras</button>
+        <button class="btn btn-sec" style="flex:1" id="cx-baremo">Bajar precios</button>
+      </div>
+      <p style="color:var(--texto-2);font-size:13px;margin:12px 0 0">
+        ${fecha ? "Catálogo actualizado el " + fecha.slice(0,10) : "Todavía no bajaste el catálogo de obras."}</p>
+      <button class="btn btn-peligro btn-bloque" id="cx-salir" style="margin-top:14px">Cerrar sesión</button>`;
+    document.getElementById("cx-catalogo").onclick = async e => {
+      e.target.disabled = true; e.target.textContent = "Bajando…";
+      try{ const n = await bajarCatalogo(); avisar(`${n} obras disponibles sin conexión`); pintarConexion(); }
+      catch(err){ avisar(err.message, true); pintarConexion(); }
+    };
+    document.getElementById("cx-baremo").onclick = async e => {
+      e.target.disabled = true; e.target.textContent = "Bajando…";
+      try{ const n = await bajarBaremo(); avisar(n ? `${n} precios actualizados` : "El servidor no tiene precios cargados", !n); }
+      catch(err){ avisar(err.message, true); }
+      pintarConexion();
+    };
+    document.getElementById("cx-salir").onclick = () => { if (confirm("¿Cerrar sesión en este equipo?")) cerrarSesion(); };
+  } else {
+    box.innerHTML = `
+      <label class="campo"><span>Correo</span><input type="text" id="cx-mail" autocomplete="username" inputmode="email"></label>
+      <label class="campo"><span>Contraseña</span><input type="password" id="cx-pass" autocomplete="current-password"></label>
+      <button class="btn btn-primario btn-bloque" id="cx-entrar">Iniciar sesión</button>
+      <p style="color:var(--texto-2);font-size:13px;margin:12px 0 0">
+        Las credenciales las crea el administrador en Supabase. La sesión queda abierta en este equipo.</p>`;
+    document.getElementById("cx-entrar").onclick = async e => {
+      const url = normalizarUrl(document.getElementById("cx-url").value);
+      const key = document.getElementById("cx-key").value.trim();
+      if (!url) return avisar("La dirección del proyecto no es válida", true);
+      if (!key) return avisar("Falta la clave anónima", true);
+      SB.guardarConfig({url, key});
+      e.target.disabled = true; e.target.textContent = "Entrando…";
+      try{
+        await iniciarSesion(document.getElementById("cx-mail").value.trim(),
+                            document.getElementById("cx-pass").value);
+        avisar("Sesión iniciada");
+        pintarConexion(); pintarEstadoNube();
+        try{ await bajarCatalogo(); await bajarBaremo(); }catch{}
+        pintarConexion();
+      }catch(err){
+        avisar(err.message, true);
+        e.target.disabled = false; e.target.textContent = "Iniciar sesión";
+      }
+    };
+  }
+
+  const pend = document.getElementById("cx-pendientes");
+  DB.todos().then(t => {
+    const p = (t || []).filter(r => r.estado !== "sincronizado");
+    const conError = p.filter(r => r.estado === "error");
+    pend.innerHTML = !p.length
+      ? `<p style="color:var(--texto-2);margin:0">Todo sincronizado.</p>`
+      : `<p style="margin:0 0 12px">${p.length} relevamiento${p.length===1?"":"s"} sin subir${
+          conError.length ? ` · <b style="color:var(--f-fisura)">${conError.length} con error</b>` : ""}.</p>
+         ${conError.map(r => `<div style="font-size:13px;color:var(--texto-2);margin-bottom:6px">
+            <b>${esc(r.cliente || r.id)}:</b> ${esc(r.ultimo_error || "")}</div>`).join("")}
+         <button class="btn btn-verde btn-bloque" id="cx-subir" style="margin-top:10px">Subir ahora</button>`;
+    const b = document.getElementById("cx-subir");
+    if (b) b.onclick = () => sincronizarTodo();
+  });
+}
+
+/* ---------- Selector de obra en el paso 1 ---------- */
+async function pintarSelectorObra(){
+  const sel = document.getElementById("f-obra_id");
+  if (!sel) return;
+  const obras = (await DB.catTodos()) || [];
+  obras.sort((a,b) => (a.razon_social||"").localeCompare(b.razon_social||""));
+  sel.innerHTML = `<option value="">— Obra nueva o no listada —</option>` +
+    obras.map(o => `<option value="${o.id}">${esc(o.razon_social)} — ${esc(o.nombre)}</option>`).join("");
+  sel.value = actual?.obra_id || "";
+  document.getElementById("aviso-catalogo").textContent = obras.length
+    ? `${obras.length} obras disponibles sin conexión.`
+    : "Sin catálogo bajado: cargá los datos a mano o bajá el catálogo desde Conexión.";
+}
+
+document.addEventListener("change", async e => {
+  if (e.target.id !== "f-obra_id") return;
+  const id = e.target.value;
+  if (!id){
+    actual.obra_id = null; actual.cliente_id = null;
+    document.getElementById("f-cliente_id").value = "";
+    return;
+  }
+  const o = ((await DB.catTodos()) || []).find(x => x.id === id);
+  if (!o) return;
+  actual.obra_id = o.id; actual.cliente_id = o.cliente_id;
+  document.getElementById("f-cliente_id").value = o.cliente_id || "";
+  const poner = (campo, valor) => { if (valor != null && valor !== ""){ actual[campo] = valor; const el = document.getElementById("f-" + campo); if (el) el.value = valor; } };
+  poner("cliente", o.razon_social); poner("dir", o.direccion);
+  poner("ot", o.ot_original); poner("m2", o.superficie_m2);
+  poner("contacto", o.contacto); poner("cel", o.telefono);
+  DB.guardar(actual);
+  avisar("Datos de la obra cargados");
+});
+
+document.getElementById("btn-nube").addEventListener("click", () => {
+  if (pantallaActual !== "p-conexion"){ volverA = pantallaActual; mostrar("p-conexion"); }
+});
+
+
+(async () => {
+  try{
+    const n = await migrarBaseAnterior();
+    if (n) avisar(`Se recuperaron ${n} relevamiento${n===1?"":"s"} de la versión anterior`);
+  }catch(e){ console.warn("Migración omitida:", e); }
+  mostrar("p-lista");
+  pintarEstadoNube();
+  if (SB.listo() && navigator.onLine) sincronizarTodo(true);
+})();
 </script>
 </body>
 </html>
